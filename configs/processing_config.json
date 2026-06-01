@@ -1,0 +1,22 @@
+{
+  "interval_seconds":          10,
+  "detection_fps":             5,
+  "vlm_sampling_fps":          2,
+  "max_retries":               5,
+
+  "models_root":               "/path/to",
+  "vlm_ckpt":                  "/path/to/Qwen3-VL-8B-Instruct_models",
+  "sam2_cfg":                  "configs/sam2.1/sam2.1_hiera_l.yaml",
+  "sam2_ckpt":                 "/path/to/sam2.1-hiera-large_models/sam2.1_hiera_large.pt",
+  "dinov2_ckpt":               "/path/to/dinov2-large_models",
+  "text_embed_ckpt":           "/path/to/bge-m3_models",
+
+  "vlm_device":                "cuda:0",
+  "sam2_device":               "cuda:1",
+  "dinov2_device":             "cuda:2",
+  "text_embed_device":         "cuda:2",
+
+  "checkpoint_every_n_clips":  10,
+  "topk_retrieval":            5,
+  "temperature":               0.0
+}

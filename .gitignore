@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Local models and datasets
+models
+models/
+data/
+
+# Runtime artifacts
+outputs/
+runs/
+debug/
+*.pkl
+*.tmp
+
+# System files
+.DS_Store
