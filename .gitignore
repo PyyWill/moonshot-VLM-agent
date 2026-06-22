@@ -11,6 +11,8 @@ env/
 models
 models/
 data/
+docs/Assembly Graph/**
+!docs/Assembly Graph/.gitkeep
 
 # Runtime artifacts
 outputs/

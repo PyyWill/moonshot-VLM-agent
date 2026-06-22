@@ -1,239 +1,214 @@
-# Moonshot VLM Agent
+# Moonshot VLM Memory System
 
-Moonshot VLM Agent builds an object-centric long-term memory from egocentric videos, then exposes a question-answering interface over that memory.
+Graph-based memory construction for first-person drone assembly videos.
 
-![Moonshot VLM Agent pipeline](assets/pipeline.svg)
+This repository keeps only the memory pipeline: video clips are converted into
+grounded part nodes, prompt-based text memory, safety warnings, a cumulative
+`VideoGraph`, and a self-contained interactive HTML report.
 
-Input: a raw RGB video, typically a first-person task video such as assembly, repair, or manipulation.
+It does not include the previous QA interface, local model servers, SAM/DINO
+object-discovery wrappers, or runtime outputs.
 
-Output:
+![Moonshot VLM memory system pipeline](assets/pipeline.svg)
 
-- A persistent `VideoGraph` memory containing objects, per-clip events, semantic facts, and object references.
-- A QA interface that retrieves relevant memories and object crops, optionally combines them with current-scene frames, and answers natural-language questions.
+## What It Builds
 
-## 1. Environment
+For each input video, the system produces:
 
-Create an environment and install dependencies:
+- `graph.pkl`: the cumulative graph-based memory;
+- `grounded_memory.html`: the default visualization with clip-by-clip memory
+  tabs and a full graph tab.
+
+The graph stores object nodes, text memory nodes, and mention edges:
+
+```text
+memory node --mention--> object node
+```
+
+Memory text is unified but typed by prefix:
+
+- `[f]` facts: visible states, hand actions, screw relations, contacts, and
+  clip-local outcomes;
+- `[r]` reasoning: durable conclusions, part roles, intent, and assembly-state
+  interpretation.
+
+Every memory node also stores `clip_id`, timestamp metadata, embeddings, and a
+`task_status=None` placeholder for later task-state annotation.
+
+## Pipeline
+
+### 1. Input Video -> Split Clips
+
+`scripts/segment_video.py` splits one `.mp4` into fixed-duration clips and a
+`manifest.json`.
+
+The formal setting uses `30s` clips. The CLI default is `10s`, so set
+`--clip-seconds 30` explicitly for the assembly experiments.
+
+### 2. Split Clips -> Local Part Nodes
+
+`mmagent/memory_builder.py` samples 15 chronological keyframes per clip by
+default. It extracts local part candidates with lightweight CV:
+
+- foreground masking and transparent crops;
+- cached reference features from `docs/Part Images`;
+- SIFT, shape, color, and geometry matching;
+- parallel keyframe processing.
+
+Part identity is closed-set for the drone-frame task:
+
+- 8 fixed part classes from `docs/Manual/manual.txt`;
+- 1 dynamic `Current_Assembly` node.
+
+### 3. Local Part Nodes -> Gemini Memory
+
+Gemini receives chronological keyframes, a fine-detail evidence sheet, object
+crops tagged as `<object_N>`, detector labels, and compact manual context from
+`mmagent/prompt.py`.
+
+The model returns high-signal `[f]` and `[r]` memory lines. The builder embeds
+these lines, links object mentions to object nodes, and reinforces similar
+reasoning memories across clips.
+
+### 4. Gemini Memory -> VideoGraph Long-Term Memory
+
+`mmagent/videograph.py` maintains the cumulative `VideoGraph`.
+
+The graph contains:
+
+- object nodes for known parts and `Current_Assembly`;
+- memory nodes for `[f]` facts and `[r]` reasoning;
+- mention edges from memory nodes to referenced object nodes.
+
+### 5. Keyframes -> Safety Warnings
+
+Safety warnings are generated separately from memory generation. The safety
+call uses only clip keyframes and the closed-set taxonomy summarized in
+`mmagent/safety.py`.
+
+Warnings follow:
+
+```text
+[TYPE] description
+```
+
+`TYPE` belongs to `S-*` safety classes or `C-*` task-correctness classes. If no
+concern is visible, the clip stores an empty list.
+
+### 6. VideoGraph -> Interactive HTML
+
+`mmagent/visualization.py` renders the default HTML:
+
+- one clip tab per processed clip;
+- object nodes, facts, reasoning, and safety warnings in the clip view;
+- a full graph tab with object/memory nodes and mention edges;
+- hover previews for object references and memory timestamps.
+
+## Install
 
 ```bash
-cd moonshot_VLM_agent
-
-conda create -n moonshot-vlm-agent python=3.10 -y
-conda activate moonshot-vlm-agent
-
 pip install -r requirements.txt
 ```
 
-Install SAM2 separately:
+Gemini calls use either environment variable:
 
 ```bash
-git clone https://github.com/facebookresearch/sam2.git
-cd sam2
-pip install -e .
-cd ../moonshot_VLM_agent
+export GEMINI_API_KEY="..."
+# or
+export GOOGLE_API_KEY="..."
 ```
 
-Edit model paths in `configs/processing_config.json`:
-
-```json
-{
-  "vlm_ckpt": "/path/to/Qwen3-VL-8B-Instruct_models",
-  "sam2_ckpt": "/path/to/sam2.1-hiera-large_models/sam2.1_hiera_large.pt",
-  "dinov2_ckpt": "/path/to/dinov2-large_models",
-  "text_embed_ckpt": "/path/to/bge-m3_models"
-}
-```
-
-If your CUDA runtime needs an extra library path, set:
+Optional model overrides:
 
 ```bash
-export CUDA_LIB_DIR=/path/to/cuda/lib
+export GEMINI_MODEL="gemini-2.5-flash"
+export SAFETY_GEMINI_MODEL="gemini-2.5-flash-lite"
+export GEMINI_EMBEDDING_MODEL="gemini-embedding-001"
 ```
 
-## 2. Input And Output
+## Run
 
-The system expects videos split into fixed-length clips under:
+### Process `0.mp4`
+
+```bash
+python scripts/segment_video.py \
+  --video 0.mp4 \
+  --out-dir runs/0mp4/clips \
+  --clip-seconds 30 \
+  --overwrite
+```
+
+```bash
+python scripts/build_memory.py \
+  --videos-dir runs/0mp4/clips \
+  --out-dir runs/0mp4/memory
+```
+
+Open:
 
 ```text
-data/videos/<video_id>/0.mp4
-data/videos/<video_id>/1.mp4
-...
+runs/0mp4/memory/grounded_memory.html
 ```
 
-Split a source video:
+### Process The Formal Assembly Video
 
 ```bash
-scripts/split_video_clips.sh /path/to/input.mp4 <video_id> 0 10
+python scripts/segment_video.py \
+  --video data/correct_assemble_v1.mp4 \
+  --out-dir runs/correct_assemble_v1/clips_30s \
+  --clip-seconds 30 \
+  --overwrite
 ```
 
-After processing, the main artifact is a pickle graph:
+```bash
+python scripts/build_memory.py \
+  --videos-dir runs/correct_assemble_v1/clips_30s \
+  --out-dir runs/correct_assemble_v1/memory
+```
+
+For a quick prefix test:
+
+```bash
+python scripts/segment_video.py \
+  --video data/correct_assemble_v1.mp4 \
+  --out-dir runs/correct_assemble_v1/clips_30s_prefix \
+  --clip-seconds 30 \
+  --prefix-seconds 60 \
+  --overwrite
+```
+
+## Outputs
 
 ```text
-data/debug/<video_id>/_graph.pkl
+runs/<video_id>/clips/manifest.json
+runs/<video_id>/clips/clip_000.mp4
+runs/<video_id>/clips/clip_001.mp4
+runs/<video_id>/memory/graph.pkl
+runs/<video_id>/memory/grounded_memory.html
 ```
 
-This graph stores the long-term memory used by the QA interface.
+After memory construction, only `graph.pkl` and `grounded_memory.html` are
+needed to reload and inspect the generated memory.
 
-## 3. Pipeline
-
-### 3.1 Video Processing
-
-Each video is processed as an ordered stream of clips. The default interval is 10 seconds.
-
-For every clip, the object stage samples keyframes, runs SAM2 segmentation, extracts masked object crops, embeds them with DINOv2, and matches them against existing object nodes for cross-clip re-identification.
-
-Run object extraction:
-
-```bash
-python scripts/run_m1_objects.py \
-  --clips-dir data/videos/<video_id> \
-  --debug-root data/debug/<video_id>
-```
-
-This writes an initial graph with object nodes:
+## Code Map
 
 ```text
-data/debug/<video_id>/_graph.pkl
+assets/pipeline.svg         project-level pipeline diagram
+scripts/segment_video.py    CLI wrapper for video segmentation
+scripts/build_memory.py     CLI wrapper for memory construction
+mmagent/video_segmenter.py  input video -> fixed-duration clips
+mmagent/memory_builder.py   keyframes -> parts -> memory -> graph -> HTML
+mmagent/prompt.py           Gemini prompt for [f] facts and [r] reasoning
+mmagent/safety.py           keyframe-only safety warning generation
+mmagent/videograph.py       graph data structure and fusion logic
+mmagent/visualization.py    clip tabs and interactive graph HTML
+mmagent/utils/general.py    graph save/load helpers
 ```
 
-### 3.2 Memory Construction
+## Notes
 
-Memory construction uses the object graph plus sampled clip frames. For each clip, the VLM receives:
-
-- sampled video frames from the clip;
-- object crop tiles labeled as `<object_N>`;
-- a memory-generation prompt.
-
-It returns two lists:
-
-- `episodic_memory`: concrete ordered events and object states in the clip;
-- `semantic_memory`: durable facts, object types, task-level conclusions, and optional equivalence lines.
-
-Run memory generation:
-
-```bash
-python scripts/run_m4_memories.py \
-  --clips-dir data/videos/<video_id> \
-  --graph data/debug/<video_id>/_graph.pkl \
-  --save-graph data/debug/<video_id>/_graph.pkl \
-  --records-dir data/debug/<video_id> \
-  --fuse
-```
-
-### 3.3 Memory Data Structure
-
-The memory is a `VideoGraph` with three node types:
-
-- `object`: stores DINOv2 embeddings, representative masked crops, `seen_count`, `first_clip`, and `last_clip`.
-- `episodic`: stores one concrete clip-level event line plus a BGE-M3 text embedding.
-- `semantic`: stores one durable fact or conclusion plus a BGE-M3 text embedding.
-
-Edges:
-
-- `mention`: connects an episodic or semantic text node to referenced object nodes.
-- `equivalence`: connects object IDs that the VLM identifies as the same physical object.
-
-Semantic memory is refined during insertion:
-
-- similar semantic facts about the same object set reinforce an existing semantic node;
-- new facts are inserted as new semantic nodes;
-- `Equivalence: <object_x>, <object_y>` lines update object identity groups and can be fused into canonical object nodes.
-
-Useful inspection tools:
-
-```bash
-python scripts/debug/visualize_memory_graph.py \
-  --graph data/debug/<video_id>/_graph.pkl \
-  --out data/debug/<video_id>/_graph.html
-
-python scripts/debug/visualize_clip_memories.py \
-  --graph data/debug/<video_id>/_graph.pkl \
-  --out data/debug/<video_id>/_clip_memories.html
-```
-
-## 4. Question Answering Interface
-
-At query time, the system:
-
-1. embeds the question with BGE-M3;
-2. retrieves top matching episodic and semantic memory nodes;
-3. collects object crops referenced by retrieved memories;
-4. optionally samples frames from the current unfinished clip;
-5. asks the VLM to answer using long-term memory, object features, and current-scene frames.
-
-Memory-only QA:
-
-```bash
-python scripts/run_m6_qa.py \
-  --graph data/debug/<video_id>/_graph.pkl \
-  -q "What did the person pick up first?"
-```
-
-Streaming-style QA at time `N * 10 + k` seconds:
-
-```bash
-python scripts/run_m6_qa.py \
-  --graph data/debug/<video_id>/_graph.pkl \
-  -q "What tool am I holding right now?" \
-  --max-clip 4 \
-  --current-clip data/videos/<video_id>/5.mp4 \
-  --short-term-seconds 3
-```
-
-Here `--max-clip 4` means long-term memory can only use finished clips `0..4`, while the first 3 seconds of clip `5.mp4` are treated as short-term current context.
-
-## 5. Model Quality And API Recommendation
-
-The current local VLM setup is useful for prototyping, but local models may be limited in:
-
-- fine-grained action recognition;
-- long-horizon temporal reasoning;
-- distinguishing visually similar parts;
-- following strict structured-output formats over many clips.
-
-For a stronger public or production version, it is recommended to replace the local VLM calls in `mmagent/utils/qwen3vl_wrapper.py` with a high-quality multimodal API. The rest of the pipeline can stay the same: object extraction, graph writes, retrieval, and QA prompt assembly are separated from the VLM backend.
-
-## 6. Adding Task Context To Prompts
-
-The memory and QA prompts live in:
-
-```text
-mmagent/prompts.py
-```
-
-You can improve memory quality by adding task-specific context, for example:
-
-- assembly manual steps;
-- part names and part images;
-- tool descriptions;
-- expected workspace layout;
-- known object categories;
-- safety or domain constraints.
-
-For richer multimodal context, extend the VLM input assembly in `mmagent/memory_processing.py` so the prompt can include extra reference images, such as part catalog images or annotated manual pages, alongside the detected `<object_N>` crops.
-
-## 7. Common Debug Commands
-
-Single-clip object debugging:
-
-```bash
-python scripts/debug/debug_m1_single_clip.py \
-  --clip-path data/videos/<video_id>/0.mp4 \
-  --clip-id 0 \
-  --debug-root data/debug/<video_id>
-```
-
-Single-clip memory debugging:
-
-```bash
-python scripts/debug/debug_m4_single_clip.py \
-  --clip-index 0 \
-  --clips-dir data/videos/<video_id> \
-  --graph data/debug/<video_id>/_graph.pkl
-```
-
-Similarity threshold diagnosis:
-
-```bash
-python scripts/debug/diagnose_similarity_matrix.py --clip-index 0
-```
+- `docs/Manual/manual.txt` defines the assembly part vocabulary.
+- `docs/Part Images` provides reference views for local part matching.
+- `docs/Part Images/.reference_features.pkl` is a rebuildable feature cache.
+- `runs/`, `outputs/`, and `data/` are runtime/local-data directories and are
+  ignored by git.

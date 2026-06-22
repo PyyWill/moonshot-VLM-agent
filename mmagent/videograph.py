@@ -2,15 +2,14 @@
 Object-centric VideoGraph.
 
 Node types:
-    object     — stores DINOv2 embeddings + masked crops for one visual entity
-    episodic   — per-clip event description text (contains <object_N> refs)
-    semantic   — durable fact text (contains <object_N> refs)
+    object     — stores representative crops and metadata for one visual entity
+    memory     — per-clip information line (contains <object_N> refs)
+                 `[f]` lines are grounded facts; `[r]` lines are reasoning.
 
 Edges:
     text_node  --mention--> object_node     (weight int, >0)
-    object_node <-> object_node             (weight int; derived from
-                                             "Equivalence: <object_x>, <object_y>"
-                                             semantic nodes via refresh_equivalences)
+    object_node <-> object_node             (legacy equivalence support; the
+                                             current builder merges by label)
 
 No edges between two text nodes.
 """
@@ -23,7 +22,6 @@ from collections import defaultdict
 from typing import Any
 
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +48,7 @@ class Node:
 
     def __init__(self, node_id: int, node_type: str, clip_id: int | None = None):
         self.id = node_id
-        self.type = node_type  # 'object' | 'episodic' | 'semantic'
+        self.type = node_type  # 'object' | 'memory' (legacy: 'episodic' | 'semantic')
         self.clip_id = clip_id
         self.metadata: dict[str, Any] = {}
 
@@ -74,6 +72,7 @@ class VideoGraph:
         self.text_nodes_by_clip: dict[int, list[int]] = defaultdict(list)
         self.object_nodes_by_clip: dict[int, list[int]] = defaultdict(list)
         self.event_sequence_by_clip: dict[int, list[int]] = defaultdict(list)
+        self.safety_warnings_by_clip: dict[int, list[str]] = defaultdict(list)
 
         self.max_object_embeddings = max_object_embeddings
         self.max_object_crops = max_object_crops
@@ -92,7 +91,7 @@ class VideoGraph:
     def add_object_node(self, payload: dict) -> int:
         """
         payload = {
-          "embeddings": [np.ndarray],         # 1+ DINOv2 vecs (unit norm)
+          "embeddings": [np.ndarray],         # optional descriptor vecs
           "contents":   [str],                # 1+ base64 png crops
           "name":       str | None,
           "first_clip": int,
@@ -142,7 +141,10 @@ class VideoGraph:
             existing = node.metadata["embeddings"]
             if not existing:
                 continue
-            sim = float(cosine_similarity(e, np.stack(existing)).max())
+            mat = np.stack(existing)
+            denom = np.linalg.norm(e, axis=1, keepdims=True) * np.linalg.norm(mat, axis=1, keepdims=True).T
+            sims = (e @ mat.T) / (denom + 1e-9)
+            sim = float(sims.max())
             if sim >= th:
                 out.append((oid, sim))
         out.sort(key=lambda x: -x[1])
@@ -191,7 +193,7 @@ class VideoGraph:
         contents: str,
         embedding: np.ndarray,
     ) -> int:
-        assert node_type in ("episodic", "semantic")
+        assert node_type in ("memory", "episodic", "semantic")
         node = Node(self._next_node_id, node_type, clip_id)
         node.metadata = {"contents": [contents], "embedding": embedding}
         self.nodes[node.id] = node
@@ -203,7 +205,7 @@ class VideoGraph:
         return node.id
 
     def reinforce_text_node(self, node_id: int, new_content: str | None = None) -> None:
-        """Bump weights of all mention edges for a semantic node; optionally append content variant."""
+        """Bump weights of all mention edges for a memory node; optionally append content variant."""
         node = self.nodes[node_id]
         if new_content is not None:
             node.metadata["contents"].append(new_content)
@@ -221,7 +223,7 @@ class VideoGraph:
                     del self.edges[key]
 
     def search_semantic_nodes_by_refs(self, refs: list[str]) -> list[int]:
-        """Return semantic node ids whose referenced object set equals `refs` (as a set)."""
+        """Legacy helper: return semantic node ids whose referenced object set equals `refs`."""
         target = set(refs)
         out = []
         for tid in self.text_nodes:
@@ -245,7 +247,7 @@ class VideoGraph:
         """
         s_type = self.nodes[src].type
         d_type = self.nodes[dst].type
-        if s_type in ("episodic", "semantic") and d_type in ("episodic", "semantic"):
+        if s_type != "object" and d_type != "object":
             raise ValueError(f"text-to-text edge not allowed: {src}({s_type}) -> {dst}({d_type})")
         if relation == "equivalence" and src > dst:
             src, dst = dst, src
@@ -303,7 +305,7 @@ class VideoGraph:
 
         for tid in self.text_nodes:
             n = self.nodes[tid]
-            if n.type != "semantic":
+            if n.type not in ("memory", "semantic"):
                 continue
             text = n.metadata["contents"][-1]
             m = EQUIVALENCE_RE.match(text)
@@ -429,7 +431,6 @@ class VideoGraph:
     def summary(self) -> str:
         return (
             f"VideoGraph(objects={len(self.object_nodes)}, "
-            f"episodic={sum(1 for t in self.text_nodes if self.nodes[t].type=='episodic')}, "
-            f"semantic={sum(1 for t in self.text_nodes if self.nodes[t].type=='semantic')}, "
+            f"memory={sum(1 for t in self.text_nodes if self.nodes[t].type!='object')}, "
             f"edges={len(self.edges)})"
         )

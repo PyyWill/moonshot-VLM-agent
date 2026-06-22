@@ -1,0 +1,6 @@
+1. Start the assembly by using the [Lumenier_QAV-S_2_Joshua_Bardwell_SE_Split_Rear_Plate] to mount the [Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_X-Lock] with the M3x22mm screws and the M3x6mm screws.
+2. Secure the [Lumenier_QAV-S_2_Joshua_Bardwell_SE_5_inch_Arm] by tightening the [Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_Arm_Wedge_5mm] using the M3x16mm screws to lock them in place.
+3. Add the [Lumenier_QAV-S_2_Joshua_Bardwell_SE_Split_Front_Plate] to the assembly and use the M3x6mm screw in the middle to secure it.
+4. Use the M3x6mm button head screws to secure the [Lumenier_QAV-S_2_Joshua_Bardwell_Knurled_Standoff] and the [Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_FPV_Camera_Mounts] to the [Lumenier_QAV-S_2_Joshua_Bardwell_SE_Split_Front_Plate]. Use the M3x16mm screws through the [Lumenier_QAV-S_2_Joshua_Bardwell_SE_5_inch_Arm] into the [Lumenier_QAV-S_2_Joshua_Bardwell_Knurled_Standoff].
+5. Secure the [Lumenier_QAV-S_2_Joshua_Bardwell_SE_Top_Plate] to the assembly by using the M3x6mm button head screws in the front and the M3x6mm countersink head screws in the back.
+6. Add the GoPro mount and the spacer plate together with a M3x8mm screw and finish the build by sticking the battery pad and the strap.
