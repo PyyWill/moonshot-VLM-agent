@@ -7,8 +7,10 @@ Hovering an object tile or any `<object_N>` reference previews the object crop.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import json
+import struct
 from pathlib import Path
 
 from mmagent.utils.general import load_video_graph
@@ -54,12 +56,79 @@ def _object_node(graph, label: str):
     return node
 
 
-def _object_crop_b64(graph, label: str) -> str | None:
+def _png_size_from_b64(b64: str) -> tuple[int, int] | None:
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        return None
+    if len(raw) >= 24 and raw.startswith(b"\x89PNG\r\n\x1a\n") and raw[12:16] == b"IHDR":
+        return struct.unpack(">II", raw[16:24])
+    return None
+
+
+def _valid_display_crop_b64(b64: str | None) -> str | None:
+    if not b64:
+        return None
+    size = _png_size_from_b64(b64)
+    if size is not None and max(size) > 480:
+        return None
+    return b64
+
+
+def _object_crop_b64(
+    graph,
+    label: str,
+    clip_id: int | None = None,
+    *,
+    inherit_previous: bool = False,
+) -> str | None:
     node = _object_node(graph, label)
     if node is None:
         return None
+    if clip_id is not None:
+        crops_by_clip = node.metadata.get("contents_by_clip") or {}
+        crops = crops_by_clip.get(str(clip_id)) or crops_by_clip.get(clip_id) or []
+        crop = _valid_display_crop_b64(crops[-1] if crops else None)
+        if crop or not inherit_previous:
+            return crop
+        previous: list[tuple[int, str]] = []
+        for key, values in crops_by_clip.items():
+            if not values:
+                continue
+            try:
+                cid = int(key)
+            except Exception:
+                continue
+            if cid < clip_id:
+                previous.append((cid, values[-1]))
+        for _, candidate in sorted(previous, reverse=True):
+            crop = _valid_display_crop_b64(candidate)
+            if crop:
+                return crop
+        return None
     crops = node.metadata.get("contents") or []
-    return crops[-1] if crops else None
+    return _valid_display_crop_b64(crops[-1] if crops else None)
+
+
+def _latest_object_crop_b64(graph, label: str) -> str | None:
+    node = _object_node(graph, label)
+    if node is None:
+        return None
+    crops_by_clip = node.metadata.get("contents_by_clip") or {}
+    candidates: list[tuple[int, str]] = []
+    for key, crops in crops_by_clip.items():
+        if not crops:
+            continue
+        try:
+            cid = int(key)
+        except Exception:
+            continue
+        candidates.append((cid, crops[-1]))
+    for _, crop in sorted(candidates, reverse=True):
+        valid_crop = _valid_display_crop_b64(crop)
+        if valid_crop:
+            return valid_crop
+    return _object_crop_b64(graph, label)
 
 
 def _object_display_name(graph, label: str) -> str:
@@ -69,7 +138,7 @@ def _object_display_name(graph, label: str) -> str:
     return str(node.metadata.get("label") or node.metadata.get("name") or label)
 
 
-def _inline_text(text: str) -> str:
+def _inline_text(text: str, clip_id: int | None = None) -> str:
     import re
 
     parts = re.split(r"(<object_\d+>)", text)
@@ -77,8 +146,9 @@ def _inline_text(text: str) -> str:
     for part in parts:
         if part.startswith("<object_") and part.endswith(">"):
             label = part[1:-1]
+            preview_key = f"clip_{clip_id}:{label}" if clip_id is not None else label
             out.append(
-                f'<span class="objref" data-obj="{label}" tabindex="0">'
+                f'<span class="objref" data-obj="{preview_key}" tabindex="0">'
                 f'&lt;{label}&gt;</span>'
             )
         else:
@@ -124,6 +194,7 @@ def _task_status_label(graph, tid: int) -> str:
 
 def _memory_item_html(graph, tid: int) -> str:
     text = graph.nodes[tid].metadata["contents"][-1]
+    clip_id = graph.nodes[tid].clip_id
     kind = _memory_kind(text)
     label = "F" if kind == "fact" else "R" if kind == "reasoning" else "M"
     timestamp = html.escape(_memory_timestamp_label(graph, tid))
@@ -131,7 +202,7 @@ def _memory_item_html(graph, tid: int) -> str:
     return (
         f'<li class="memory-item {kind}" data-timestamp="{timestamp}" aria-label="Timestamp {timestamp}">'
         f'<span class="memory-badge">{label}</span>'
-        f'<span><span class="memory-text">{_inline_text(_clean_memory_text(text))}</span>'
+        f'<span><span class="memory-text">{_inline_text(_clean_memory_text(text), clip_id=clip_id)}</span>'
         f'<span class="memory-meta"><span>Task {task_status}</span></span></span>'
         f'</li>'
     )
@@ -182,8 +253,8 @@ def _referenced_objects_for_clip(graph, cid: int) -> list[str]:
     return sorted(out, key=_sort_object_token)
 
 
-def _render_object_tile(graph, canon: str, thumb_px: int) -> str:
-    b64 = _object_crop_b64(graph, canon)
+def _render_object_tile(graph, canon: str, thumb_px: int, clip_id: int | None = None) -> str:
+    b64 = _object_crop_b64(graph, canon, clip_id=clip_id, inherit_previous=True)
     name = html.escape(_object_display_name(graph, canon))
     try:
         object_mark = f"O{int(canon.split('_')[1])}"
@@ -214,7 +285,7 @@ def _render_clip(graph, cid: int, thumb_px: int) -> str:
     objects = _referenced_objects_for_clip(graph, cid)
     safety_warnings = list(getattr(graph, "safety_warnings_by_clip", {}).get(cid, []))
 
-    object_tiles = "\n".join(_render_object_tile(graph, obj, thumb_px) for obj in objects)
+    object_tiles = "\n".join(_render_object_tile(graph, obj, thumb_px, clip_id=cid) for obj in objects)
     if not object_tiles:
         object_tiles = '<div class="empty">No object references for this clip.</div>'
 
@@ -982,7 +1053,8 @@ function previewFor(label) {
   const b64 = OBJ_CROPS[label];
   if (!b64) return false;
   document.getElementById('pimg').src = 'data:image/png;base64,' + b64;
-  document.getElementById('plabel').textContent = '<' + label + '>';
+  const displayLabel = label.includes(':') ? label.split(':').pop() : label;
+  document.getElementById('plabel').textContent = '<' + displayLabel + '>';
   preview.style.display = 'block';
   return true;
 }
@@ -1345,17 +1417,27 @@ if (first) showView(first.dataset.target);
 
 def _crop_lookup(graph) -> dict[str, str]:
     lookup: dict[str, str] = {}
+    clip_ids = _clip_ids(graph)
     for oid in graph.object_nodes:
         node = graph.nodes[oid]
-        crops = node.metadata.get("contents") or []
-        if crops:
-            lookup[f"object_{oid}"] = crops[-1]
+        token = f"object_{oid}"
+        crop = _latest_object_crop_b64(graph, token)
+        if crop:
+            lookup[token] = crop
+        for clip_id in clip_ids:
+            clip_crop = _object_crop_b64(graph, token, clip_id=clip_id, inherit_previous=True)
+            if clip_crop:
+                lookup[f"clip_{clip_id}:{token}"] = clip_crop
     for canon, group in graph.character_mappings.items():
         crop = lookup.get(canon)
         if not crop:
             continue
         for alias in group:
             lookup.setdefault(alias, crop)
+            for key, value in list(lookup.items()):
+                if key.endswith(f":{canon}"):
+                    prefix = key.rsplit(":", 1)[0]
+                    lookup.setdefault(f"{prefix}:{alias}", value)
     return lookup
 
 

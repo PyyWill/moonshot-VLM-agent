@@ -14,8 +14,8 @@ import ast
 import base64
 import json
 import os
-import pickle
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
@@ -46,20 +46,9 @@ UNSUPPORTED_VISIBILITY_CHANGE_RE = re.compile(
     r"selected for|picked up|removed)\b",
     re.IGNORECASE,
 )
-REFERENCE_CACHE_VERSION = 1
 CURRENT_ASSEMBLY_LABEL = "Current_Assembly"
+REJECT_LABEL = "Reject"
 DEFAULT_KEYFRAME_RATIOS = ",".join(f"{(i + 0.5) / 15:.6f}" for i in range(15))
-
-
-@dataclass
-class ReferenceView:
-    label: str
-    path: Path
-    crop_rgb: np.ndarray
-    mask: np.ndarray
-    keypoints: Any
-    descriptors: np.ndarray | None
-    contour: np.ndarray | None
 
 
 @dataclass
@@ -72,14 +61,42 @@ class Candidate:
     area: float
     crop_rgb: np.ndarray
     crop_mask: np.ndarray
-    clean_crop_rgb: np.ndarray
-    keypoints: Any
-    descriptors: np.ndarray | None
-    contour: np.ndarray | None
     stats: dict[str, float]
     label: str | None = None
     confidence: float = 0.0
     rationale: str = ""
+
+    @property
+    def center(self) -> tuple[float, float]:
+        x, y, w, h = self.bbox_xywh
+        return x + w * 0.5, y + h * 0.5
+
+    @property
+    def size(self) -> float:
+        _, _, w, h = self.bbox_xywh
+        return float(max(w, h))
+
+
+@dataclass
+class CandidateCluster:
+    members: list[Candidate]
+
+    @property
+    def representative(self) -> Candidate:
+        return max(self.members, key=lambda c: (c.area, -abs(c.frame_index - 7)))
+
+    @property
+    def seen_count(self) -> int:
+        return len({c.frame_index for c in self.members})
+
+    @property
+    def max_area(self) -> float:
+        return max(c.area for c in self.members)
+
+    @property
+    def mean_center(self) -> tuple[float, float]:
+        centers = np.array([c.center for c in self.members], dtype=np.float32)
+        return float(centers[:, 0].mean()), float(centers[:, 1].mean())
 
 
 @dataclass
@@ -119,8 +136,13 @@ def _parse_args() -> argparse.Namespace:
         help="Parallel keyframe workers per clip. Use 0 for auto, 1 for serial.",
     )
     p.add_argument("--min-component-area", type=float, default=80.0)
-    p.add_argument("--crop-padding", type=int, default=10)
+    p.add_argument("--crop-padding", type=int, default=15)
     p.add_argument("--gemini-model", default=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+    p.add_argument(
+        "--object-gemini-model",
+        default=os.getenv("OBJECT_GEMINI_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        help="Gemini model used for VLM-enhanced crop/object recognition.",
+    )
     p.add_argument(
         "--safety-gemini-model",
         default=os.getenv("SAFETY_GEMINI_MODEL", "gemini-2.5-flash-lite"),
@@ -221,15 +243,6 @@ def _short_label(label: str | None) -> str | None:
         if label.startswith(prefix):
             return label[len(prefix) :]
     return label
-
-
-def _short_reference_name(name: str) -> str:
-    path = Path(name)
-    stem = path.stem
-    base = VIEW_SUFFIX_RE.sub("", stem)
-    view_suffix = stem[len(base) :]
-    short = _short_label(base) or base
-    return f"{short}{view_suffix}{path.suffix}"
 
 
 def _pil_to_b64_png(img: Image.Image) -> str:
@@ -374,17 +387,39 @@ def _build_keyframe_sheet(
 
 def _transparent_crop(candidate: Candidate, *, max_side: int = 360) -> Image.Image:
     rgb = np.asarray(candidate.crop_rgb, dtype=np.uint8)
-    alpha = (np.asarray(candidate.crop_mask) > 0).astype(np.uint8) * 255
+    mask = (np.asarray(candidate.crop_mask) > 0).astype(np.uint8)
 
-    ys, xs = np.where(alpha > 0)
+    ys, xs = np.where(mask > 0)
     if len(xs) and len(ys):
+        object_w = int(xs.max() - xs.min() + 1)
+        object_h = int(ys.max() - ys.min() + 1)
+        object_max = max(object_w, object_h)
+        is_small = object_max < 90 or candidate.area < 1600
+        is_medium = object_max < 150 or candidate.area < 4200
         pad = 2
+        if is_small:
+            pad = max(12, min(30, int(round(object_max * 0.55))))
+        elif is_medium:
+            pad = max(8, min(22, int(round(object_max * 0.25))))
         x0 = max(0, int(xs.min()) - pad)
-        x1 = min(alpha.shape[1], int(xs.max()) + pad + 1)
+        x1 = min(mask.shape[1], int(xs.max()) + pad + 1)
         y0 = max(0, int(ys.min()) - pad)
-        y1 = min(alpha.shape[0], int(ys.max()) + pad + 1)
+        y1 = min(mask.shape[0], int(ys.max()) + pad + 1)
         rgb = rgb[y0:y1, x0:x1]
-        alpha = alpha[y0:y1, x0:x1]
+        mask = mask[y0:y1, x0:x1]
+        if is_small:
+            # Tiny wedge/standoff masks are often partial; showing the local
+            # crop context is more useful than a perfectly cut but incomplete
+            # silhouette.
+            alpha = np.full(mask.shape, 255, dtype=np.uint8)
+        else:
+            if is_medium:
+                k = max(3, min(9, int(round(object_max * 0.08)) | 1))
+                kernel = np.ones((k, k), np.uint8)
+                mask = cv2.dilate(mask, kernel, iterations=1)
+            alpha = mask.astype(np.uint8) * 255
+    else:
+        alpha = np.full(mask.shape, 255, dtype=np.uint8)
 
     rgba = np.dstack([rgb, alpha])
     img = Image.fromarray(rgba, mode="RGBA")
@@ -407,35 +442,6 @@ def _foreground_mask(rgb: np.ndarray) -> np.ndarray:
     return mask
 
 
-def _bbox_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) > 20]
-    if not contours:
-        return None
-    xs, ys, xe, ye = [], [], [], []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        xs.append(x)
-        ys.append(y)
-        xe.append(x + w)
-        ye.append(y + h)
-    return min(xs), min(ys), max(xe) - min(xs), max(ye) - min(ys)
-
-
-def _largest_contour(mask: np.ndarray) -> np.ndarray | None:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = [c for c in contours if cv2.contourArea(c) > 20]
-    if not contours:
-        return None
-    return max(contours, key=cv2.contourArea)
-
-
-def _clean_crop(crop_rgb: np.ndarray, crop_mask: np.ndarray) -> np.ndarray:
-    out = crop_rgb.copy()
-    out[crop_mask == 0] = 255
-    return out
-
-
 def _compute_stats(rgb: np.ndarray, mask: np.ndarray, area: float) -> dict[str, float]:
     h, w = rgb.shape[:2]
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
@@ -455,126 +461,6 @@ def _compute_stats(rgb: np.ndarray, mask: np.ndarray, area: float) -> dict[str, 
     }
 
 
-def _extract_sift(gray_rgb: np.ndarray) -> tuple[Any, np.ndarray | None]:
-    gray = cv2.cvtColor(gray_rgb, cv2.COLOR_RGB2GRAY)
-    # Small objects need upsampling; large objects tolerate it and produce more
-    # stable texture/edge matches against reference photos.
-    scale = 6 if min(gray.shape[:2]) < 60 else 3
-    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    detector = cv2.SIFT_create()
-    return detector.detectAndCompute(gray, None)
-
-
-def _reference_cache_path(parts_dir: Path) -> Path:
-    return parts_dir / ".reference_features.pkl"
-
-
-def _reference_signatures(refs_paths: dict[str, list[Path]]) -> list[dict[str, Any]]:
-    signatures: list[dict[str, Any]] = []
-    for label, paths in sorted(refs_paths.items()):
-        for path in sorted(paths):
-            st = path.stat()
-            signatures.append(
-                {
-                    "label": label,
-                    "name": path.name,
-                    "size": st.st_size,
-                    "mtime_ns": st.st_mtime_ns,
-                }
-            )
-    return signatures
-
-
-def _load_reference_cache(
-    cache_path: Path,
-    labels: list[str],
-    signatures: list[dict[str, Any]],
-) -> list[ReferenceView] | None:
-    if not cache_path.exists():
-        return None
-    try:
-        with cache_path.open("rb") as f:
-            payload = pickle.load(f)
-    except Exception:
-        return None
-    if payload.get("version") != REFERENCE_CACHE_VERSION:
-        return None
-    if payload.get("labels") != labels:
-        return None
-    if payload.get("signatures") != signatures:
-        return None
-    refs = payload.get("refs")
-    if not isinstance(refs, list):
-        return None
-    return refs
-
-
-def _save_reference_cache(
-    cache_path: Path,
-    labels: list[str],
-    signatures: list[dict[str, Any]],
-    refs: list[ReferenceView],
-) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "version": REFERENCE_CACHE_VERSION,
-        "labels": labels,
-        "signatures": signatures,
-        "refs": refs,
-    }
-    with cache_path.open("wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def _build_references(parts_dir: Path, labels: list[str]) -> list[ReferenceView]:
-    refs: list[ReferenceView] = []
-    allowed = set(labels)
-    for path in sorted(parts_dir.iterdir()):
-        if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
-            continue
-        label = VIEW_SUFFIX_RE.sub("", path.stem)
-        if label not in allowed:
-            continue
-        rgb = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
-        mask = _foreground_mask(rgb)
-        bbox = _bbox_from_mask(mask)
-        if bbox is None:
-            continue
-        x, y, w, h = bbox
-        crop_rgb = rgb[y : y + h, x : x + w]
-        crop_mask = mask[y : y + h, x : x + w]
-        clean = _clean_crop(crop_rgb, crop_mask)
-        _, desc = _extract_sift(clean)
-        refs.append(
-            ReferenceView(
-                label=label,
-                path=path,
-                crop_rgb=clean,
-                mask=crop_mask,
-                keypoints=None,
-                descriptors=desc,
-                contour=_largest_contour(crop_mask),
-            )
-        )
-    return refs
-
-
-def _load_references(
-    parts_dir: Path,
-    labels: list[str],
-    refs_paths: dict[str, list[Path]] | None = None,
-) -> list[ReferenceView]:
-    grouped_paths = refs_paths or _load_reference_paths(parts_dir, labels)
-    signatures = _reference_signatures(grouped_paths)
-    cache_path = _reference_cache_path(parts_dir)
-    cached = _load_reference_cache(cache_path, labels, signatures)
-    if cached is not None:
-        return cached
-    refs = _build_references(parts_dir, labels)
-    _save_reference_cache(cache_path, labels, signatures, refs)
-    return refs
-
-
 def _extract_candidates(
     frame_rgb: np.ndarray,
     *,
@@ -587,7 +473,7 @@ def _extract_candidates(
     mask = _foreground_mask(frame_rgb)
     h_img, w_img = frame_rgb.shape[:2]
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    raw: list[tuple[int, int, int, int, float, np.ndarray]] = []
+    raw: list[tuple[int, int, int, int, float]] = []
     for contour in contours:
         area = float(cv2.contourArea(contour))
         x, y, w, h = cv2.boundingRect(contour)
@@ -598,23 +484,18 @@ def _extract_candidates(
         # Border fragments from the tabletop/video edge are not part nodes.
         if x <= 5 or y <= 5:
             continue
-        raw.append((x, y, w, h, area, contour))
+        raw.append((x, y, w, h, area))
     raw.sort(key=lambda b: (b[1], b[0]))
 
     candidates: list[Candidate] = []
-    for idx, (x, y, w, h, area, contour) in enumerate(raw):
+    for idx, (x, y, w, h, area) in enumerate(raw):
         x0, y0 = max(0, x - pad), max(0, y - pad)
         x1, y1 = min(w_img, x + w + pad), min(h_img, y + h + pad)
         crop_rgb = frame_rgb[y0:y1, x0:x1]
         crop_mask = mask[y0:y1, x0:x1]
-        clean = _clean_crop(crop_rgb, crop_mask)
-        kp, desc = _extract_sift(clean)
         stats = _compute_stats(frame_rgb[y : y + h, x : x + w], mask[y : y + h, x : x + w], area)
         stats["frame_w"] = float(w_img)
         stats["frame_h"] = float(h_img)
-        local_contour = contour.copy()
-        local_contour[:, 0, 0] -= x
-        local_contour[:, 0, 1] -= y
         candidates.append(
             Candidate(
                 candidate_id=idx,
@@ -625,10 +506,6 @@ def _extract_candidates(
                 area=area,
                 crop_rgb=crop_rgb,
                 crop_mask=crop_mask,
-                clean_crop_rgb=clean,
-                keypoints=kp,
-                descriptors=desc,
-                contour=local_contour,
                 stats=stats,
             )
         )
@@ -653,7 +530,6 @@ def _process_keyframe_detection(
     max_frame_width: int,
     min_area: float,
     pad: int,
-    refs: list[ReferenceView],
 ) -> tuple[KeyframeFeature, list[Candidate]]:
     pil = _extract_frame(video_path, timestamp_sec, max_frame_width)
     keyframe = KeyframeFeature(
@@ -670,8 +546,6 @@ def _process_keyframe_detection(
         min_area=min_area,
         pad=pad,
     )
-    for candidate in candidates:
-        _classify_candidate(candidate, refs)
     return keyframe, candidates
 
 
@@ -683,7 +557,6 @@ def _process_clip_keyframes(
     max_frame_width: int,
     min_area: float,
     pad: int,
-    refs: list[ReferenceView],
     frame_workers: int,
 ) -> list[tuple[KeyframeFeature, list[Candidate]]]:
     tasks = list(enumerate(timestamps))
@@ -698,7 +571,6 @@ def _process_clip_keyframes(
                 max_frame_width=max_frame_width,
                 min_area=min_area,
                 pad=pad,
-                refs=refs,
             )
             for frame_index, timestamp_sec in tasks
         ]
@@ -713,194 +585,388 @@ def _process_clip_keyframes(
                 max_frame_width=max_frame_width,
                 min_area=min_area,
                 pad=pad,
-                refs=refs,
             )
             for frame_index, timestamp_sec in tasks
         ]
         return [future.result() for future in futures]
 
 
-def _sift_good_matches(desc_a: np.ndarray | None, desc_b: np.ndarray | None) -> int:
-    if desc_a is None or desc_b is None or len(desc_a) < 2 or len(desc_b) < 2:
-        return 0
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
-    matches = matcher.knnMatch(desc_a, desc_b, k=2)
-    return sum(1 for m, n in matches if m.distance < 0.75 * n.distance)
+def _bbox_iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix0, iy0 = max(ax, bx), max(ay, by)
+    ix1, iy1 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    iw, ih = max(0, ix1 - ix0), max(0, iy1 - iy0)
+    inter = iw * ih
+    union = aw * ah + bw * bh - inter
+    return float(inter / union) if union > 0 else 0.0
 
 
-def _shape_score(cand: Candidate, ref: ReferenceView) -> float:
-    if cand.contour is None or ref.contour is None:
-        return 99.0
-    return float(cv2.matchShapes(cand.contour, ref.contour, cv2.CONTOURS_MATCH_I1, 0.0))
+def _cluster_candidates(candidates: list[Candidate]) -> list[CandidateCluster]:
+    clusters: list[CandidateCluster] = []
+    for candidate in sorted(candidates, key=lambda c: (c.frame_index, -c.area)):
+        cx, cy = candidate.center
+        best: CandidateCluster | None = None
+        best_dist = float("inf")
+        for cluster in clusters:
+            rep = cluster.representative
+            rx, ry = cluster.mean_center
+            dist = float(np.hypot(cx - rx, cy - ry))
+            size_gate = max(14.0, 0.35 * min(candidate.size, rep.size))
+            area_ratio = candidate.area / max(rep.area, 1.0)
+            overlaps = _bbox_iou(candidate.bbox_xywh, rep.bbox_xywh) >= 0.12
+            nearly_same_center = dist <= size_gate
+            if (overlaps or nearly_same_center) and 0.25 <= area_ratio <= 4.0 and dist < best_dist:
+                best = cluster
+                best_dist = dist
+        if best is None:
+            best = CandidateCluster(members=[])
+            clusters.append(best)
+        best.members.append(candidate)
+
+    kept: list[CandidateCluster] = []
+    for cluster in clusters:
+        rep = cluster.representative
+        _, _, w, h = rep.bbox_xywh
+        persistent = cluster.seen_count >= 2
+        large = cluster.max_area >= 700
+        distinctive_small = cluster.max_area >= 110 and max(w, h) <= 70 and cluster.seen_count >= 2
+        if persistent or large or distinctive_small:
+            kept.append(cluster)
+
+    kept.sort(key=lambda c: (c.representative.frame_index, c.representative.bbox_xywh[1], c.representative.bbox_xywh[0]))
+    return kept[:60]
 
 
-def _is_purple_candidate(c: Candidate) -> bool:
-    s = c.stats
-    return (
-        105 <= s["hue_mean"] <= 165
-        and s["sat_median"] >= 38
-        and s["val_mean"] >= 90
-        and s["fill_frac"] >= 0.35
-    )
+def _candidate_color_fractions(candidate: Candidate) -> tuple[float, float]:
+    hsv = cv2.cvtColor(candidate.crop_rgb, cv2.COLOR_RGB2HSV)
+    fg = candidate.crop_mask > 0
+    vals = hsv[fg] if np.any(fg) else hsv.reshape(-1, 3)
+    purple = float(np.mean((vals[:, 0] >= 105) & (vals[:, 0] <= 165) & (vals[:, 1] >= 35) & (vals[:, 2] >= 60)))
+    dark = float(np.mean(vals[:, 2] < 125))
+    return purple, dark
 
 
-def _is_dark_screw_like(c: Candidate) -> bool:
-    s = c.stats
-    return (
-        s["area"] < 360
-        and s["val_mean"] < 110
-        and s["fill_frac"] < 0.55
-        and s["sat_median"] < 36
-    )
+def _fit_thumb(image: Image.Image, size: tuple[int, int], bg=(255, 255, 255)) -> Image.Image:
+    thumb = image.copy().convert("RGB")
+    thumb.thumbnail(size, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", size, bg)
+    canvas.paste(thumb, ((size[0] - thumb.width) // 2, (size[1] - thumb.height) // 2))
+    return canvas
 
 
-def _is_tiny_arm_wedge(c: Candidate) -> bool:
-    """Tiny purple arm wedges are easy to reject as dark screw fragments."""
-    x, y, _, _ = c.bbox_xywh
-    s = c.stats
-    formal_staging_position = 170 <= x <= 260 and 205 <= y <= 255
-    old_demo_position = x < 260 and y > 245
-    return (
-        65 <= s["area"] <= 260
-        and _is_purple_candidate(c)
-        and 1.0 <= s["aspect_hw"] <= 2.5
-        and (formal_staging_position or old_demo_position)
-    )
+def _candidate_as_namespace(candidate: Candidate) -> Any:
+    return type(
+        "CandidateView",
+        (),
+        {
+            "crop_rgb": candidate.crop_rgb,
+            "crop_mask": candidate.crop_mask,
+            "area": candidate.area,
+        },
+    )()
 
 
-def _is_top_view_standoff(c: Candidate) -> bool:
-    """Top-view standoffs appear as tiny dark/purple round-ish rings."""
-    x, y, _, _ = c.bbox_xywh
-    s = c.stats
-    return (
-        90 <= s["area"] <= 300
-        and 0.45 <= s["aspect_hw"] <= 0.95
-        and 0.25 <= s["fill_frac"] <= 0.65
-        and 70 <= s["val_mean"] <= 120
-        and 200 <= y <= 270
-        and 300 <= x <= 520
-    )
-
-
-def _rank_for_label(ranked: list[dict[str, Any]], label: str) -> dict[str, Any]:
-    for item in ranked:
-        if item["label"] == label:
-            return item
-    return {"label": label, "sift_good": 0, "shape_score": 99.0, "reference": ""}
-
-
-def _classify_candidate(c: Candidate, refs: list[ReferenceView]) -> None:
-    label_scores: dict[str, dict[str, Any]] = {}
-    for ref in refs:
-        good = _sift_good_matches(c.descriptors, ref.descriptors)
-        shape = _shape_score(c, ref)
-        prev = label_scores.get(ref.label)
-        if prev is None or (good, -shape) > (prev["sift_good"], -prev["shape_score"]):
-            label_scores[ref.label] = {
-                "sift_good": good,
-                "shape_score": shape,
-                "reference": ref.path.name,
-            }
-
-    ranked = sorted(
-        (
+def _build_candidate_sheet(clusters: list[CandidateCluster]) -> tuple[Image.Image, list[dict[str, Any]]]:
+    records: list[dict[str, Any]] = []
+    crops: list[Image.Image] = []
+    for idx, cluster in enumerate(clusters):
+        candidate = cluster.representative
+        purple, dark = _candidate_color_fractions(candidate)
+        crop = _transparent_crop(_candidate_as_namespace(candidate), max_side=360)
+        crops.append(crop)
+        records.append(
             {
-                "label": label,
-                "sift_good": vals["sift_good"],
-                "shape_score": vals["shape_score"],
-                "reference": vals["reference"],
+                "candidate": f"<candidate_{idx:02d}>",
+                "cluster": cluster,
+                "representative": candidate,
+                "frame_index": candidate.frame_index,
+                "timestamp_sec": round(candidate.timestamp_sec, 3),
+                "bbox_xywh": [int(v) for v in candidate.bbox_xywh],
+                "area": round(candidate.area, 2),
+                "cluster_seen_count": cluster.seen_count,
+                "cluster_member_count": len(cluster.members),
+                "purple_frac": round(purple, 4),
+                "dark_frac": round(dark, 4),
             }
-            for label, vals in label_scores.items()
-        ),
-        key=lambda x: (x["sift_good"], -x["shape_score"]),
-        reverse=True,
+        )
+
+    cols, tile_w, tile_h = 8, 164, 178
+    rows = int(np.ceil(len(records) / cols)) or 1
+    sheet = Image.new("RGB", (cols * tile_w, rows * tile_h + 42), (250, 248, 252))
+    draw = ImageDraw.Draw(sheet)
+    draw.text((12, 13), "candidate_crop_sheet: unlabeled candidate crops", fill=(17, 24, 39))
+    for idx, (record, crop) in enumerate(zip(records, crops)):
+        col, row = idx % cols, idx // cols
+        x0, y0 = col * tile_w, 42 + row * tile_h
+        draw.rectangle((x0, y0, x0 + tile_w - 1, y0 + tile_h - 1), outline=(228, 220, 234), fill=(255, 255, 255))
+        draw.text((x0 + 7, y0 + 7), record["candidate"], fill=(124, 83, 166))
+        draw.text((x0 + 7, y0 + 27), f"K{record['frame_index']:02d}  t={record['timestamp_sec']:.1f}s", fill=(113, 108, 118))
+        img = crop.copy().convert("RGBA")
+        img.thumbnail((tile_w - 20, tile_h - 62), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (tile_w - 14, tile_h - 58), (255, 255, 255, 255))
+        canvas.alpha_composite(img, ((canvas.width - img.width) // 2, (canvas.height - img.height) // 2))
+        sheet.paste(canvas.convert("RGB"), (x0 + 7, y0 + 51))
+    return sheet, records
+
+
+def _build_reference_sheet(labels: list[str], refs_paths: dict[str, list[Path]]) -> Image.Image:
+    items: list[tuple[str, Path]] = []
+    for full_label in labels:
+        short = _short_label(full_label) or full_label
+        for path in sorted(refs_paths.get(full_label, [])):
+            items.append((short, path))
+
+    tile_w, thumb_h, header, cols = 220, 150, 42, 4
+    rows = int(np.ceil(len(items) / cols)) or 1
+    sheet = Image.new("RGB", (cols * tile_w, rows * (thumb_h + header)), (250, 248, 252))
+    draw = ImageDraw.Draw(sheet)
+    for idx, (short, path) in enumerate(items):
+        col, row = idx % cols, idx // cols
+        x0, y0 = col * tile_w, row * (thumb_h + header)
+        draw.rectangle((x0, y0, x0 + tile_w - 1, y0 + thumb_h + header - 1), outline=(228, 220, 234), fill=(255, 255, 255))
+        draw.text((x0 + 7, y0 + 5), short[:28], fill=(34, 36, 40))
+        draw.text((x0 + 7, y0 + 23), path.stem[-28:], fill=(113, 108, 118))
+        sheet.paste(_fit_thumb(Image.open(path).convert("RGB"), (tile_w - 14, thumb_h - 8)), (x0 + 7, y0 + header))
+    return sheet
+
+
+def _plate_like_tokens(records: list[dict[str, Any]]) -> list[str]:
+    return [
+        record["candidate"]
+        for record in records
+        if record["area"] >= 4500 and record["purple_frac"] < 0.03 and record["dark_frac"] >= 0.75
+    ]
+
+
+def _build_plate_candidate_sheet(records: list[dict[str, Any]], tokens: list[str]) -> Image.Image:
+    by_token = {record["candidate"]: record for record in records}
+    cell_w, cell_h = 260, 260
+    sheet = Image.new("RGB", (max(1, len(tokens)) * cell_w, cell_h), (250, 248, 252))
+    draw = ImageDraw.Draw(sheet)
+    for idx, token in enumerate(tokens):
+        record = by_token[token]
+        candidate = record["representative"]
+        crop = _transparent_crop(_candidate_as_namespace(candidate), max_side=360)
+        x0 = idx * cell_w
+        draw.rectangle((x0, 0, x0 + cell_w - 1, cell_h - 1), outline=(228, 220, 234), fill=(255, 255, 255))
+        draw.text((x0 + 8, 8), token, fill=(124, 83, 166))
+        draw.text((x0 + 8, 27), f"K{record['frame_index']:02d}  t={record['timestamp_sec']:.1f}s", fill=(113, 108, 118))
+        crop.thumbnail((cell_w - 32, cell_h - 62), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (cell_w - 16, cell_h - 56), (255, 255, 255, 255))
+        canvas.alpha_composite(crop.convert("RGBA"), ((canvas.width - crop.width) // 2, (canvas.height - crop.height) // 2))
+        sheet.paste(canvas.convert("RGB"), (x0 + 8, 48))
+    return sheet
+
+
+def _object_label_prompt(records: list[dict[str, Any]], closed_labels: list[str]) -> str:
+    tokens = [record["candidate"] for record in records]
+    plate_like = _plate_like_tokens(records)
+    small_components = [record["candidate"] for record in records if record["area"] <= 500]
+    possible_assemblies = [
+        record["candidate"]
+        for record in records
+        if record["area"] >= 1200 and record["purple_frac"] >= 0.08 and record["dark_frac"] >= 0.18
+    ]
+    return f"""You are verifying object labels for a drone assembly video clip.
+
+You receive exactly two images:
+1. candidate_crop_sheet: unlabeled candidate crops, each identified as <candidate_XX>.
+2. reference_part_sheet: the 8 valid standalone part classes with reference images and labels.
+
+Assign every candidate token below to exactly one label from the closed set.
+
+Candidates:
+{json.dumps(tokens, ensure_ascii=False)}
+
+Closed label set:
+{json.dumps(closed_labels, ensure_ascii=False)}
+
+Candidate visual hints computed from crop geometry/color; these are not labels:
+- Large black/carbon plate-like candidates: {json.dumps(plate_like, ensure_ascii=False)}. First choose among Top_Plate, Split_Front_Plate, and Split_Rear_Plate by silhouette and hole layout.
+- Small loose-component candidates: {json.dumps(small_components, ensure_ascii=False)}. Prefer Arm_Wedge_5mm, Knurled_Standoff, or Reject unless an inserted/fastened connection is clearly visible.
+- Purple-plus-dark large candidates that may be assemblies: {json.dumps(possible_assemblies, ensure_ascii=False)}.
+
+Visual criteria:
+- Top_Plate: long, narrow black/carbon plate with a slim body, row-like central openings, and a fork/U-shaped end.
+- Split_Front_Plate: tapered black/carbon split plate with two lower rounded feet/lobes and fewer paired circular holes.
+- Split_Rear_Plate: broader, more symmetric black/carbon split plate with a wide U/notch and many paired circular screw holes.
+- 5_inch_Arm: long single black arm, usually with a large round/hex motor hole near one end.
+- X-Lock: purple cross/X shaped aluminum plate.
+- FPV_Camera_Mounts: small purple camera bracket pieces with circular/rounded central cutout.
+- Arm_Wedge_5mm: tiny purple/black aluminum wedge; in top view it can look like a purple crescent.
+- Knurled_Standoff: tiny black/dark cylindrical round post or peg, often visible from top as a small black circle.
+- Current_Assembly: multiple parts clearly physically connected, inserted, fastened, or overlapping as an assembled subassembly.
+
+Important rules:
+- Do not use Split_Rear_Plate as a generic label for all black plates.
+- Use Current_Assembly only when there is a clear physical connection; loose nearby parts on the table are not Current_Assembly.
+- Use Reject only for shadows, hands/tools, background, unknown objects, duplicated slivers, or isolated fragments with no visible part-part connection.
+- Return strict JSON only. Include every candidate exactly once.
+
+Output schema:
+{{"assignments": [{{"candidate": "<candidate_00>", "label": "one of the closed-set labels"}}]}}
+"""
+
+
+def _parse_label_response(raw: str, expected_tokens: set[str], closed_labels: set[str]) -> dict[str, str]:
+    text = _strip_code_fence(raw)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = ast.literal_eval(text)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("assignments"), list):
+        raise ValueError("Gemini label response must contain an assignments list.")
+    out: dict[str, str] = {}
+    for item in parsed["assignments"]:
+        if not isinstance(item, dict):
+            raise ValueError("assignment items must be objects.")
+        token = str(item.get("candidate", "")).strip()
+        label = str(item.get("label", "")).strip()
+        if token not in expected_tokens or label not in closed_labels:
+            raise ValueError(f"invalid label assignment: {item!r}")
+        out[token] = label
+    if set(out) != expected_tokens:
+        raise ValueError("label response did not include every candidate exactly once.")
+    return out
+
+
+def _call_label_gemini(
+    *,
+    prompt: str,
+    images: list[Image.Image],
+    model: str,
+    expected_tokens: set[str],
+    closed_labels: set[str],
+    max_retries: int = 2,
+) -> dict[str, str]:
+    client, types = _get_gemini_client()
+    contents: list[Any] = [prompt]
+    for index, image in enumerate(images):
+        contents.append(f"image_{index}")
+        contents.append(types.Part.from_bytes(data=_pil_to_jpeg_bytes(image, max_width=1280), mime_type="image/jpeg"))
+
+    last_raw = ""
+    for attempt in range(max_retries):
+        config_kwargs: dict[str, Any] = {
+            "temperature": 0.0,
+            "top_p": 0.1,
+            "seed": 1 + attempt,
+            "response_mime_type": "application/json",
+        }
+        if hasattr(types, "ThinkingConfig"):
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+        response = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+        last_raw = getattr(response, "text", "") or ""
+        try:
+            return _parse_label_response(last_raw, expected_tokens, closed_labels)
+        except (SyntaxError, ValueError, json.JSONDecodeError):
+            continue
+    raise RuntimeError(f"Gemini did not return valid object labels. Last response: {last_raw[:500]!r}")
+
+
+def _refine_plate_labels(
+    records: list[dict[str, Any]],
+    reference_sheet: Image.Image,
+    *,
+    model: str,
+) -> dict[str, str]:
+    tokens = _plate_like_tokens(records)
+    if not tokens:
+        return {}
+    prompt = f"""Classify only these large black/carbon plate-like candidates.
+
+You receive two images:
+1. plate_candidate_sheet: enlarged crops for the candidate tokens below.
+2. reference_part_sheet: reference images for all valid parts.
+
+Candidate tokens:
+{json.dumps(tokens, ensure_ascii=False)}
+
+Allowed labels:
+["Top_Plate", "Split_Front_Plate", "Split_Rear_Plate", "Reject"]
+
+Compare silhouette and hole layout carefully. Mentally rotate candidates if needed.
+- Top_Plate: long and narrow, slim body, row of central openings, fork/U-shaped end.
+- Split_Front_Plate: tapered split plate with two lower rounded feet/lobes and fewer paired circular holes.
+- Split_Rear_Plate: broader and more symmetric split plate with a wide U/notch and many paired circular screw holes.
+
+Return strict JSON only:
+{{"assignments": [{{"candidate": "<candidate_00>", "label": "one of the allowed labels"}}]}}
+"""
+    return _call_label_gemini(
+        prompt=prompt,
+        images=[_build_plate_candidate_sheet(records, tokens), reference_sheet],
+        model=model,
+        expected_tokens=set(tokens),
+        closed_labels={"Top_Plate", "Split_Front_Plate", "Split_Rear_Plate", REJECT_LABEL},
     )
-    x, y, w, h = c.bbox_xywh
-    s = c.stats
-    best = ranked[0] if ranked else {"label": None, "sift_good": 0, "shape_score": 99.0}
-    best_label = str(best["label"])
-    best_good = int(best["sift_good"])
 
-    # Carbon-fiber pieces share many black edges/holes; unconstrained SIFT tends
-    # to over-attract them to the top-plate reference. First separate by object
-    # geometry, then use SIFT only inside the ambiguous split-plate pair.
-    if s["area"] > 1300 and s["val_mean"] < 80:
-        if s["area"] > 5600 and 2.1 <= s["aspect_hw"] <= 2.8:
-            c.label = "Lumenier_QAV-S_2_Joshua_Bardwell_SE_Top_Plate"
-            c.confidence = 0.95
-            c.rationale = "large tall carbon plate; geometry matches top plate"
-            return
-        if s["area"] > 3800 and 1.4 <= s["aspect_hw"] <= 2.2:
-            front = _rank_for_label(ranked, "Lumenier_QAV-S_2_Joshua_Bardwell_SE_Split_Front_Plate")
-            rear = _rank_for_label(ranked, "Lumenier_QAV-S_2_Joshua_Bardwell_SE_Split_Rear_Plate")
-            chosen = front if front["sift_good"] >= rear["sift_good"] else rear
-            c.label = str(chosen["label"])
-            c.confidence = min(0.92, 0.68 + int(chosen["sift_good"]) / 60.0)
-            c.rationale = (
-                f"split-plate geometry; SIFT chose "
-                f"{_short_reference_name(str(chosen['reference']))} "
-                f"({chosen['sift_good']} good matches)"
-            )
-            return
-        if 1700 <= s["area"] <= 3400 and s["aspect_hw"] >= 2.25:
-            c.label = "Lumenier_QAV-S_2_Joshua_Bardwell_SE_5_inch_Arm"
-            c.confidence = 0.86
-            c.rationale = "long narrow carbon arm geometry"
-            return
 
-    if _is_top_view_standoff(c):
-        c.label = "Lumenier_QAV-S_2_Joshua_Bardwell_Knurled_Standoff"
-        c.confidence = 0.74
-        c.rationale = "tiny top-view standoff: dark/purple round ring candidate"
+def _apply_label_guards(assignments: dict[str, str], records: list[dict[str, Any]]) -> dict[str, str]:
+    corrected = dict(assignments)
+    by_token = {record["candidate"]: record for record in records}
+    for token, label in list(corrected.items()):
+        record = by_token[token]
+        _, _, w, h = record["bbox_xywh"]
+        if (
+            label in {REJECT_LABEL, "Knurled_Standoff", "Arm_Wedge_5mm"}
+            and 90 <= record["area"] <= 500
+            and w / max(h, 1) >= 1.2
+            and record["purple_frac"] >= 0.18
+            and record["dark_frac"] >= 0.45
+        ):
+            corrected[token] = CURRENT_ASSEMBLY_LABEL
+            continue
+        if label == "Arm_Wedge_5mm" and record["purple_frac"] < 0.08 and record["dark_frac"] > 0.12:
+            corrected[token] = "Knurled_Standoff"
+    return corrected
+
+
+def _assign_clip_object_labels_with_gemini(
+    candidates: list[Candidate],
+    labels: list[str],
+    refs_paths: dict[str, list[Path]],
+    *,
+    model: str,
+) -> None:
+    clusters = _cluster_candidates(candidates)
+    if not clusters:
         return
+    candidate_sheet, records = _build_candidate_sheet(clusters)
+    reference_sheet = _build_reference_sheet(labels, refs_paths)
+    short_to_full = {_short_label(label) or label: label for label in labels}
+    closed_labels = list(short_to_full) + [CURRENT_ASSEMBLY_LABEL, REJECT_LABEL]
 
-    # Small purple arm wedges can be darker than the tabletop and were
-    # previously rejected as screw-like fragments in the formal staging video.
-    if _is_tiny_arm_wedge(c):
-        c.label = "Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_Arm_Wedge_5mm"
-        c.confidence = 0.74
-        c.rationale = "tiny purple wedge-like component in the staged arm-wedge region"
-        return
+    assignments = _call_label_gemini(
+        prompt=_object_label_prompt(records, closed_labels),
+        images=[candidate_sheet, reference_sheet],
+        model=model,
+        expected_tokens={record["candidate"] for record in records},
+        closed_labels=set(closed_labels),
+    )
+    assignments.update(_refine_plate_labels(records, reference_sheet, model=model))
+    assignments = _apply_label_guards(assignments, records)
 
-    if _is_dark_screw_like(c):
-        c.label = None
-        c.confidence = 0.0
-        c.rationale = "rejected dark screw-like small component"
-        return
-
-    # Purple medium-size parts: camera mounts and X-lock. The X-lock has weak
-    # SIFT after perspective/blur, but remains a larger bottom-row cross shape.
-    if _is_purple_candidate(c) and s["area"] > 700:
-        fpv = _rank_for_label(ranked, "Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_FPV_Camera_Mounts")
-        if x > 190 and fpv["sift_good"] >= 5 and 0.65 <= s["aspect_hw"] <= 1.35:
-            c.label = "Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_FPV_Camera_Mounts"
-            c.confidence = min(0.94, 0.62 + int(fpv["sift_good"]) / 70.0)
-            c.rationale = (
-                f"purple camera-mount geometry with SIFT support "
-                f"({_short_reference_name(str(fpv['reference']))}, {fpv['sift_good']} good matches)"
-            )
-            return
-        if y > 240 and x < 210 and 0.65 <= s["aspect_hw"] <= 1.25:
-            c.label = "Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_X-Lock"
-            c.confidence = 0.82
-            c.rationale = "larger bottom-row purple cross-shaped component"
-            return
-        if best_label == "Lumenier_QAV-S_2_Joshua_Bardwell_Aluminum_FPV_Camera_Mounts" and best_good >= 6:
-            c.label = best_label
-            c.confidence = min(0.92, 0.50 + best_good / 50.0)
-            c.rationale = f"purple camera-mount SIFT match ({best_good} good matches)"
-            return
-
-    # Remaining strong local texture/edge matches handle unambiguous parts.
-    if s["area"] > 1300 and best_good >= 10:
-        c.label = best_label
-        c.confidence = min(0.98, 0.55 + best_good / 80.0)
-        c.rationale = f"SIFT match to {_short_reference_name(str(best['reference']))} ({best_good} good matches)"
-        return
-
-    c.label = None
-    c.confidence = 0.0
-    c.rationale = "no confident part-class match"
+    for record in records:
+        label = assignments[record["candidate"]]
+        if label == REJECT_LABEL:
+            full_label = None
+            confidence = 0.0
+        elif label == CURRENT_ASSEMBLY_LABEL:
+            full_label = CURRENT_ASSEMBLY_LABEL
+            confidence = 0.96
+        else:
+            full_label = short_to_full.get(label)
+            confidence = 0.95 if full_label else 0.0
+        for candidate in record["cluster"].members:
+            candidate.label = full_label
+            candidate.confidence = confidence
+            candidate.rationale = f"Gemini crop label: {label}"
 
 
 def _build_graph(
@@ -922,6 +988,12 @@ def _build_graph(
             continue
         label = _short_label(full_label) or full_label
         crop = _transparent_crop(_representative_candidate(group))
+        contents_by_clip: dict[str, list[str]] = {}
+        for clip_id in sorted({c.clip_id for c in group}):
+            clip_group = [c for c in group if c.clip_id == clip_id]
+            if clip_group:
+                clip_crop = _transparent_crop(_representative_candidate(clip_group))
+                contents_by_clip[str(clip_id)] = [_pil_to_b64_png(clip_crop)]
         first_clip = min(c.clip_id for c in group)
         last_clip = max(c.clip_id for c in group)
         oid = graph.add_object_node(
@@ -938,7 +1010,8 @@ def _build_graph(
             {
                 "label": label,
                 "full_label": full_label,
-                "source": "cv_foreground_sift_part_images",
+                "source": "vlm_enhanced_crop_part_images",
+                "contents_by_clip": contents_by_clip,
             }
         )
         for clip_id in sorted({c.clip_id for c in group}):
@@ -958,12 +1031,27 @@ def _build_graph(
 def _add_current_assembly_node(
     graph: VideoGraph,
     keyframes_by_clip: dict[int, list[KeyframeFeature]],
+    accepted: list[Candidate],
 ) -> int | None:
     clip_ids = sorted(keyframes_by_clip)
     if not clip_ids:
         return None
     zero = np.zeros((1,), dtype=np.float32)
-    representative = _build_keyframe_sheet(keyframes_by_clip[clip_ids[-1]])
+    assembly_candidates = [c for c in accepted if c.label == CURRENT_ASSEMBLY_LABEL]
+    contents_by_clip: dict[str, list[str]] = {}
+    for clip_id in clip_ids:
+        clip_assembly = [c for c in assembly_candidates if c.clip_id == clip_id]
+        if clip_assembly:
+            image = _transparent_crop(_representative_candidate(clip_assembly))
+            contents_by_clip[str(clip_id)] = [_pil_to_b64_png(image)]
+    representative = None
+    if contents_by_clip:
+        representative_b64 = contents_by_clip[str(max(int(cid) for cid in contents_by_clip))][-1]
+        representative = Image.open(BytesIO(base64.b64decode(representative_b64))).convert("RGBA")
+    elif assembly_candidates:
+        representative = _transparent_crop(_representative_candidate(assembly_candidates))
+    if representative is None:
+        representative = _build_keyframe_sheet(keyframes_by_clip[clip_ids[-1]])
     if representative is None:
         representative = Image.new("RGB", (320, 180), (250, 248, 252))
     oid = graph.add_object_node(
@@ -980,7 +1068,8 @@ def _add_current_assembly_node(
         {
             "label": CURRENT_ASSEMBLY_LABEL,
             "full_label": CURRENT_ASSEMBLY_LABEL,
-            "source": "dynamic_keyframe_current_assembly_state",
+            "source": "vlm_enhanced_current_assembly_crop_or_keyframe_state",
+            "contents_by_clip": contents_by_clip,
         }
     )
     for clip_id in clip_ids:
@@ -1303,24 +1392,29 @@ def _write_memory_lines_to_graph(
 
 
 def main() -> None:
+    total_start = time.perf_counter()
     args = _parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    timings: dict[str, Any] = {"clips": {}}
 
+    setup_start = time.perf_counter()
     labels = _read_manual_labels(args.manual)
     refs_paths = _load_reference_paths(args.parts_dir, labels)
     missing_refs = [label for label, paths in refs_paths.items() if not paths]
     if missing_refs:
         raise SystemExit(f"missing part reference images for labels: {missing_refs}")
-    refs = _load_references(args.parts_dir, labels, refs_paths)
 
     video_paths = _resolve_videos(args)
     ratios = [float(x) for x in args.keyframe_ratios.split(",") if x.strip()]
+    timings["setup_sec"] = round(time.perf_counter() - setup_start, 3)
 
     all_candidates: list[Candidate] = []
     keyframes_by_clip: dict[int, list[KeyframeFeature]] = {}
     clip_time_ranges: dict[int, dict[str, float]] = {}
     elapsed_sec = 0.0
     for clip_id, video_path in enumerate(video_paths):
+        clip_timing: dict[str, float] = {}
+        clip_start = time.perf_counter()
         duration = _video_duration(video_path)
         clip_time_ranges[clip_id] = {
             "clip_start_sec": round(elapsed_sec, 3),
@@ -1328,6 +1422,7 @@ def main() -> None:
         }
         elapsed_sec += duration
         timestamps = _keyframe_timestamps(duration, ratios)
+        detect_start = time.perf_counter()
         results = _process_clip_keyframes(
             video_path,
             clip_id,
@@ -1335,22 +1430,39 @@ def main() -> None:
             max_frame_width=args.max_frame_width,
             min_area=args.min_component_area,
             pad=args.crop_padding,
-            refs=refs,
             frame_workers=args.frame_workers,
         )
+        clip_timing["keyframe_crop_sec"] = round(time.perf_counter() - detect_start, 3)
+        clip_candidates: list[Candidate] = []
         for keyframe, candidates in results:
             keyframes_by_clip.setdefault(clip_id, []).append(keyframe)
+            clip_candidates.extend(candidates)
             all_candidates.extend(candidates)
+        object_start = time.perf_counter()
+        _assign_clip_object_labels_with_gemini(
+            clip_candidates,
+            labels,
+            refs_paths,
+            model=args.object_gemini_model,
+        )
+        clip_timing["object_recognition_sec"] = round(time.perf_counter() - object_start, 3)
+        clip_timing["clip_total_sec"] = round(time.perf_counter() - clip_start, 3)
+        clip_timing["raw_candidates"] = float(len(clip_candidates))
         keyframes_by_clip[clip_id].sort(key=lambda keyframe: keyframe.frame_index)
+        timings["clips"][str(clip_id)] = clip_timing
 
+    graph_start = time.perf_counter()
     accepted = [c for c in all_candidates if c.label is not None]
     graph, stats, label_to_oid = _build_graph(accepted, labels)
-    current_assembly_oid = _add_current_assembly_node(graph, keyframes_by_clip)
+    current_assembly_oid = _add_current_assembly_node(graph, keyframes_by_clip, accepted)
+    timings["graph_build_sec"] = round(time.perf_counter() - graph_start, 3)
 
     memory_counts = {"facts": 0, "reasoning": 0, "reinforced_reasoning": 0}
     safety_warning_count = 0
     for clip_id, video_path in enumerate(video_paths):
+        clip_timing = timings["clips"].setdefault(str(clip_id), {})
         clip_keyframes = keyframes_by_clip.get(clip_id, [])
+        feature_start = time.perf_counter()
         object_features = _collect_clip_object_features(
             graph,
             accepted,
@@ -1359,12 +1471,18 @@ def main() -> None:
             current_assembly_oid=current_assembly_oid,
             keyframes=clip_keyframes,
         )
+        clip_timing["object_feature_sec"] = round(time.perf_counter() - feature_start, 3)
+        memory_start = time.perf_counter()
         lines = _generate_memory_lines_with_gemini(
             clip_keyframes,
             object_features,
             model=args.gemini_model,
         )
+        clip_timing["memory_generation_sec"] = round(time.perf_counter() - memory_start, 3)
+        embed_start = time.perf_counter()
         embeddings = _embed_memory_lines_with_gemini(lines, model=args.gemini_embedding_model)
+        clip_timing["embedding_sec"] = round(time.perf_counter() - embed_start, 3)
+        write_start = time.perf_counter()
         counts = _write_memory_lines_to_graph(
             graph,
             clip_id,
@@ -1373,20 +1491,28 @@ def main() -> None:
             reasoning_merge_threshold=args.reasoning_merge_threshold,
             time_range=clip_time_ranges.get(clip_id),
         )
+        clip_timing["memory_graph_write_sec"] = round(time.perf_counter() - write_start, 3)
         for key, value in counts.items():
             memory_counts[key] += value
+        safety_start = time.perf_counter()
         safety_warnings = generate_safety_warnings_with_gemini(
             clip_keyframes,
             model=args.safety_gemini_model,
         )
+        clip_timing["safety_generation_sec"] = round(time.perf_counter() - safety_start, 3)
         graph.safety_warnings_by_clip[clip_id] = safety_warnings
         safety_warning_count += len(safety_warnings)
 
+    save_start = time.perf_counter()
     graph_path = args.out_dir / "graph.pkl"
     save_video_graph(graph, str(graph_path))
+    timings["save_graph_sec"] = round(time.perf_counter() - save_start, 3)
 
+    html_start = time.perf_counter()
     html_path = args.out_dir / "grounded_memory.html"
     render_memory_html(graph, html_path)
+    timings["render_html_sec"] = round(time.perf_counter() - html_start, 3)
+    timings["total_sec"] = round(time.perf_counter() - total_start, 3)
 
     report = {
         "out_dir": str(args.out_dir),
@@ -1402,6 +1528,7 @@ def main() -> None:
         "reasoning": memory_counts["reasoning"],
         "reinforced_reasoning": memory_counts["reinforced_reasoning"],
         "safety_warnings": safety_warning_count,
+        "timings": timings,
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
 
